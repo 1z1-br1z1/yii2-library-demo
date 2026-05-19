@@ -1,0 +1,175 @@
+# Yii2 Book Catalog
+
+## Тестовое задание
+
+Необходимо сделать на фреймворке Yii2 + MySQL каталог книг. Книга может иметь несколько авторов. Тестовое задание можно делать без верстки.
+
+**Сущности:**
+1. Книга — название, год выпуска, описание, ISBN, фото главной страницы.
+2. Авторы — ФИО.
+
+**Права доступа:**
+1. Гость — только просмотр + подписка на новые книги автора.
+2. Юзер — просмотр, добавление, редактирование, удаление.
+
+**Отчёт** — ТОП 10 авторов, выпустившие больше книг за какой-то год (доступен всем пользователям).
+
+**Плюсом:** уведомление о поступлении книг из подписки должно отправляться на SMS гостю через [SmsPilot API](https://smspilot.ru/) (эмулятор — реальной отправки не происходит).
+
+**Стек:** PHP 8+, MySQL/MariaDB, Yii2 basic template.
+
+---
+
+## Реализованный функционал
+
+| Требование | Статус |
+|---|---|
+| Книги: название, год выпуска, описание, ISBN, фото | ✓ |
+| Авторы: ФИО | ✓ |
+| Книга может иметь несколько авторов | ✓ |
+| Гость — просмотр + подписка на автора | ✓ |
+| Юзер — полный CRUD книг и авторов | ✓ |
+| Отчёт: ТОП-10 авторов по количеству книг за год | ✓ |
+| SMS-уведомление подписчикам при добавлении книги (SmsPilot) | ✓ |
+
+## Архитектура
+
+Приложение построено по сервисно-ориентированной архитектуре:
+
+```
+HTTP Request
+    └── Controller        — принимает запрос, делегирует в сервис
+           └── Service    — вся бизнес-логика (транзакции, очередь)
+                  └── Model (ActiveRecord) — работа с БД
+```
+
+### Ключевые решения
+
+**Тонкие контроллеры.** Контроллеры не содержат бизнес-логики — только загрузка формы, вызов сервиса и редирект/рендер. Всё остальное инкапсулировано в `BookService` / `AuthorService`.
+
+**Эффективная работа с БД.** Eager loading связей через `with('authors')` / `with('books')` устраняет N+1 запросы. Синхронизация авторов книги (`syncAuthors`) работает дифференциально: только добавляет новые и удаляет убранные связи через `book2author`. Отчёт ТОП-10 строится одним SQL-запросом с `INNER JOIN`, `GROUP BY` и `LIMIT 10`.
+
+**Фоновые уведомления.** При добавлении книги (или добавлении автора к книге) в очередь `yii2-queue` помещается `NotifyAuthorSubscribersJob`. Задание выполняется асинхронно, не блокируя ответ пользователю.
+
+**Подключаемые уведомления.** `NotificationInterface` задаёт контракт, `SmsNotification` — реализация через SmsPilot API. Привязка через DI-контейнер Yii2 в `config/web.php` — замена канала не требует правки кода.
+
+**Безопасность.** API-ключ SmsPilot и учётные данные БД хранятся в `.env` (не в коде). `AccessControl` на уровне `behaviors()` разграничивает доступ гостей (`?`) и авторизованных пользователей (`@`). Удаление книги — только POST (`VerbFilter`).
+
+## Стек
+
+- **PHP** 8.4
+- **Yii2** (basic template)
+- **MySQL** / MariaDB
+- **yii2-queue** (file driver) — фоновые задания
+- **SmsPilot API** — SMS-уведомления
+- **Codeception** — тесты
+- **Docker** — локальная разработка
+
+## Схема БД
+
+```
+book          — id, name, note, year, isbn, photo, created, updated
+author        — id, fio, created, updated
+book2author   — bookId, authorId  (M:M)
+subscription  — id, authorId, phone, created, updated
+user          — id, username, auth_key, password_hash, ...
+```
+
+Уникальный индекс `uk_book_isbn` гарантирует уникальность ISBN. Уникальный составной индекс `uk_subscription_authorId_phone` исключает дублирующие подписки. Индекс `ik_book_year` ускоряет фильтрацию в отчёте.
+
+## Быстрый старт
+
+### Docker (рекомендуется)
+
+```bash
+# 1. Клонировать репозиторий
+git clone <repo-url>
+cd ./basic
+
+# 2. Настроить окружение
+cp .env.example .env
+# Заполнить DB_NAME, DB_USER, DB_PASS, COOKIE_VALIDATION_KEY в .env
+
+# 3. Установить зависимости и запустить
+docker-compose run --rm php composer install
+docker-compose up -d
+
+# 4. Применить миграции
+docker-compose run --rm php php yii migrate
+```
+
+Приложение доступно по адресу `http://localhost:8000`.
+
+### Без Docker
+
+```bash
+composer install
+cp .env.example .env   # заполнить переменные
+php yii migrate
+php -S localhost:8000 -t web
+```
+
+## Переменные окружения
+
+| Переменная | Описание |
+|---|---|
+| `DB_HOST` | Хост MySQL (по умолчанию `localhost`) |
+| `DB_NAME` | Имя базы данных |
+| `DB_USER` | Пользователь БД |
+| `DB_PASS` | Пароль БД |
+| `SMSPILOT_API_KEY` | API-ключ SmsPilot (для теста — эмулятор из документации) |
+| `SENDER_NAME` | Имя отправителя SMS |
+| `COOKIE_VALIDATION_KEY` | Ключ для подписи cookie |
+
+Для тестирования SMS используется [ключ-эмулятор SmsPilot](https://smspilot.ru/) — реальная отправка не происходит.
+
+## Фоновая очередь
+
+Уведомления отправляются через очередь заданий:
+
+```bash
+# Запустить обработчик очереди (блокирующий режим)
+php yii queue/listen
+
+# Разовый прогон очереди
+php yii queue/run
+```
+
+## Тесты
+
+```bash
+# Все тесты
+vendor/bin/codecept run
+
+# Конкретный suite
+vendor/bin/codecept run unit
+vendor/bin/codecept run functional
+
+# С покрытием
+vendor/bin/codecept run --coverage --coverage-html
+```
+
+## Структура проекта
+
+```
+basic/
+├── commands/          # CLI-команды (TestController)
+├── config/            # web.php, console.php, db.php
+├── controllers/       # BookController, AuthorController, SiteController
+├── jobs/              # NotifyAuthorSubscribersJob
+├── migrations/        # Миграции БД
+├── models/            # ActiveRecord + форм-модели
+├── notifications/     # NotificationInterface, SmsNotification
+├── services/          # BookService, AuthorService, NotificationService
+├── tests/             # Codeception (unit, functional)
+└── web/               # Публичный root
+```
+
+## Права доступа
+
+| Действие | Гость | Пользователь |
+|---|---|---|
+| Просмотр книг и авторов | ✓ | ✓ |
+| Подписка на автора (SMS) | ✓ | — |
+| Добавление / редактирование / удаление | — | ✓ |
+| Отчёт ТОП-10 авторов | ✓ | ✓ |
